@@ -1,0 +1,471 @@
+{
+  "name": "补货监控（可自选网站）",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "adf0c0a1-0000-4000-8000-000000000001",
+      "name": "每 5 分钟",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "adf0c0a1-0000-4000-8000-000000000002",
+      "name": "手动测试",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "table",
+        "operation": "create",
+        "tableName": "补货监控状态",
+        "columns": {
+          "column": [
+            {
+              "name": "key",
+              "type": "string"
+            },
+            {
+              "name": "name",
+              "type": "string"
+            },
+            {
+              "name": "status",
+              "type": "string"
+            },
+            {
+              "name": "restockTime",
+              "type": "number"
+            },
+            {
+              "name": "failCount",
+              "type": "number"
+            },
+            {
+              "name": "failWarned",
+              "type": "boolean"
+            },
+            {
+              "name": "checkedAt",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {
+          "createIfNotExists": true
+        }
+      },
+      "id": "adf0c0a1-0000-4000-8000-000000000003",
+      "name": "确保状态表存在",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        100
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "补货监控状态"
+        },
+        "returnAll": true
+      },
+      "id": "adf0c0a1-0000-4000-8000-000000000004",
+      "name": "读取上次状态",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        100
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ====== 配置：在这里添加你要监控的商品 ======\nconst TARGETS = [\n  // 示例 1：Shopify 店铺。把域名和商品 handle 换成你的，再把 enabled 改成 true\n  {\n    enabled: false,\n    key: 'shopify-example',                 // 唯一标识，只用英文、数字、横线，配好后不要改\n    name: '示例商品（Shopify）',\n    type: 'json',\n    url: 'https://shop.example.com/products/your-product.js',\n    buyUrl: 'https://shop.example.com/products/your-product',\n    path: 'available',                      // 库存字段的路径\n    inStockWhen: true,                      // 这个字段等于什么值时算有货\n  },\n  // 示例 2：接口用状态标记表示库存\n  {\n    enabled: false,\n    key: 'json-status-example',\n    name: '示例商品（JSON 接口）',\n    type: 'json',\n    url: 'https://api.example.com/product/123',\n    buyUrl: 'https://www.example.com/product/123',\n    path: 'data.status',                    // 字段可以是单个值，也可以是数组\n    outValues: ['out_of_stock', 'sold_out'],// 出现其中任何一个就算缺货\n    restockTimePath: 'data.restock_time',   // 可选：预计补货时间（Unix 秒），临近时自动加快检查\n  },\n  // 示例 3：普通网页，靠页面上的文字判断\n  {\n    enabled: false,\n    key: 'html-example',\n    name: '示例商品（普通网页）',\n    type: 'html',\n    url: 'https://www.example.com/item/123',\n    outOfStockText: ['Sold Out', '缺货', '售罄'], // 页面出现这些字算缺货（优先判断）\n    inStockText: ['Add to Cart', '加入购物车'],   // 页面出现这些字算有货\n    intervalMinutes: 30,                    // 可选：检查间隔（分钟），默认 15，最小 5\n  },\n];\n// ============================================\n\n// 决定这一轮要查哪些商品。手动运行时查全部；定时运行时按各自的间隔\nconst MIN_MINUTES = 5;      // 最小检查间隔，请不要调低，以免给对方网站造成压力\nconst DEFAULT_MINUTES = 15;\n\nconst enabled = TARGETS.filter((t) => t.enabled);\nconst manual = $execution.mode === 'manual';\nif (!enabled.length) {\n  if (manual) throw new Error('还没有启用任何监控项：请在「监控列表」节点的 TARGETS 里配置商品，并把 enabled 改成 true');\n  return [];\n}\n\nconst keys = enabled.map((t) => t.key);\nconst bad = enabled.find((t) => !/^[A-Za-z0-9_-]+$/.test(t.key || '') || !/^https?:\\/\\//.test(t.url || '') || !['json', 'html'].includes(t.type));\nif (bad) throw new Error(`监控项配置有误：${bad.name || bad.key}（检查 key、url、type）`);\nif (new Set(keys).size !== keys.length) throw new Error('监控项的 key 有重复');\n\nconst states = {};\nfor (const { json } of $('读取上次状态').all()) if (json.key) states[json.key] = json;\n\nconst now = Date.now();\nreturn enabled.filter((t) => {\n  if (manual) return true;\n  const s = states[t.key] || {};\n  const last = Date.parse(s.checkedAt || '') || 0;\n  const restockAt = Number(s.restockTime || 0) * 1000;\n  const near = restockAt > 0 && now >= restockAt - 10 * 60e3 && now <= restockAt + 2 * 3600e3;\n  const minutes = near ? MIN_MINUTES : Math.max(MIN_MINUTES, t.intervalMinutes || DEFAULT_MINUTES);\n  return now - last >= minutes * 60e3 - 30e3;\n}).map((t) => ({ json: t }));"
+      },
+      "id": "adf0c0a1-0000-4000-8000-000000000005",
+      "name": "监控列表",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (compatible; n8n-restock-monitor)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "body"
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "id": "adf0c0a1-0000-4000-8000-000000000006",
+      "name": "抓取页面",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        100
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// 判断库存。只有明确识别到状态才算数；识别不了算失败，绝不当作有货\nconst BROKEN_AFTER = 8; // 连续失败这么多次，发一封「可能失效」提醒\n\nconst get = (obj, path) => String(path || '').split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);\nconst pageText = (html) => String(html || '')\n  .replace(/<(script|style|noscript)[\\s\\S]*?<\\/\\1>/gi, ' ')\n  .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\\s+/g, ' ').toLowerCase();\nconst has = (text, words) => (words || []).some((w) => text.includes(String(w).toLowerCase()));\n\nconst check = (t, res) => {\n  if (res.error) return { error: String(res.error.message || res.error).slice(0, 200) };\n  const raw = String(res.body ?? '');\n  if (/captcha|cf-chl|just a moment|attention required/i.test(raw.slice(0, 5000))) {\n    return { error: '页面要求人机验证，无法读取（本工作流不会绕过验证）' };\n  }\n  if (t.type === 'html') {\n    const text = pageText(raw);\n    if (has(text, t.outOfStockText)) return { status: 'out_of_stock' };\n    if (has(text, t.inStockText)) return { status: 'in_stock' };\n    return { error: '页面上没有找到配置的文字，可能是页面改版，或内容由脚本加载' };\n  }\n  let data;\n  try { data = JSON.parse(raw); } catch (e) { return { error: '返回内容不是 JSON' }; }\n  const value = get(data, t.path);\n  if (value === undefined || value === null) return { error: `返回内容里没有字段 ${t.path}` };\n  const restockTime = Number(get(data, t.restockTimePath)) || 0;\n  if (Array.isArray(t.outValues)) {\n    const values = Array.isArray(value) ? value : [value];\n    return { status: values.some((v) => t.outValues.includes(v)) ? 'out_of_stock' : 'in_stock', restockTime };\n  }\n  if (t.inStockWhen === undefined) return { error: '配置缺少 outValues 或 inStockWhen' };\n  return { status: value === t.inStockWhen ? 'in_stock' : 'out_of_stock', restockTime };\n};\n\nconst states = {};\nfor (const { json } of $('读取上次状态').all()) if (json.key) states[json.key] = json;\n\nreturn $input.all().map((item, i) => {\n  const t = $('监控列表').itemMatching(i).json;\n  const prev = states[t.key] || {};\n  const r = check(t, item.json);\n  const base = { key: t.key, name: t.name, buyUrl: t.buyUrl || t.url, checkedAt: new Date().toISOString() };\n\n  if (r.error) {\n    const failCount = Number(prev.failCount || 0) + 1;\n    const warn = failCount >= BROKEN_AFTER && !prev.failWarned;\n    return { json: { ...base, status: prev.status || 'unknown', restockTime: Number(prev.restockTime || 0), failCount,\n      failWarned: Boolean(prev.failWarned) || warn, notify: warn ? 'broken' : '', reason: r.error } };\n  }\n  return { json: { ...base, status: r.status, restockTime: r.restockTime || 0, failCount: 0, failWarned: false,\n    // 只在「不是有货 → 有货」时通知\n    notify: r.status === 'in_stock' && prev.status !== 'in_stock' ? 'restock' : '', reason: '' } };\n});"
+      },
+      "id": "adf0c0a1-0000-4000-8000-000000000007",
+      "name": "判断状态",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "补货监控状态"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "key",
+              "condition": "eq",
+              "keyValue": "={{ $json.key }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "key": "={{ $json.key }}",
+            "name": "={{ $json.name }}",
+            "status": "={{ $json.status }}",
+            "restockTime": "={{ $json.restockTime }}",
+            "failCount": "={{ $json.failCount }}",
+            "failWarned": "={{ $json.failWarned }}",
+            "checkedAt": "={{ $json.checkedAt }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "key",
+              "displayName": "key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "name",
+              "displayName": "name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "restockTime",
+              "displayName": "restockTime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "failCount",
+              "displayName": "failCount",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "failWarned",
+              "displayName": "failWarned",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "checkedAt",
+              "displayName": "checkedAt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "adf0c0a1-0000-4000-8000-000000000008",
+      "name": "保存状态",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1440,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 把这一轮需要通知的商品合并成一封邮件；没有就到此结束\nconst all = $('判断状态').all().map((i) => i.json);\nconst restocked = all.filter((s) => s.notify === 'restock');\nconst broken = all.filter((s) => s.notify === 'broken');\nif (!restocked.length && !broken.length) return [];\n\nconst esc = (x) => String(x ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\nlet html = '';\nfor (const s of restocked) {\n  html += `<h3 style=\"margin:18px 0 10px\">${esc(s.name)}</h3><p><a href=\"${esc(s.buyUrl)}\" style=\"background:#16a34a;color:#fff;padding:10px 24px;border-radius:8px;text-decoration:none;font-weight:600\">立即前往购买</a></p>`;\n}\nif (broken.length) {\n  html += '<h3 style=\"margin:22px 0 8px\">⚠️ 以下监控可能失效</h3><p>已连续多次读取不到库存，恢复之前可能收不到补货提醒：</p><ul>' +\n    broken.map((s) => `<li><b>${esc(s.name)}</b>：${esc(s.reason)}</li>`).join('') + '</ul>';\n}\nconst names = restocked.map((s) => s.name).join('、');\nreturn [{ json: {\n  subject: restocked.length ? `🟢 补货了：${names}` : '⚠️ 补货监控可能失效',\n  color: restocked.length ? '#16a34a' : '#d97706',\n  title: restocked.length ? '🟢 补货了' : '⚠️ 补货监控可能失效',\n  sub: $now.toFormat('yyyy-MM-dd HH:mm'),\n  html,\n} }];"
+      },
+      "id": "adf0c0a1-0000-4000-8000-000000000009",
+      "name": "生成提醒",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        100
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "fromEmail": "补货监控 <you@example.com>",
+        "toEmail": "you@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "=<div style=\"background:#f4f5f7;padding:24px 12px\"><div style=\"max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;color:#1f2328;font-size:15px;line-height:1.7\"><div style=\"background:{{ $json.color }};padding:22px 28px;color:#fff\"><div style=\"font-size:22px;font-weight:700\">{{ $json.title }}</div><div style=\"font-size:14px;opacity:.9;margin-top:4px\">{{ $json.sub }}</div></div><div style=\"padding:8px 28px 24px\">{{ $json.html }}</div></div></div>",
+        "options": {}
+      },
+      "id": "adf0c0a1-0000-4000-8000-000000000010",
+      "name": "发送邮件",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1920,
+        100
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "adf0c0a1-0000-4000-8000-000000000011",
+      "name": "发送测试邮件",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 发一封示例提醒，确认邮箱能收到（不查库存，也不改变状态）\nreturn [{ json: {\n  subject: '🟢【测试】补货提醒示例', color: '#16a34a', title: '🟢【测试】补货了', sub: '这是一封测试邮件',\n  html: '<p>能收到这封邮件，说明发信配置是正常的。</p>',\n} }];"
+      },
+      "id": "adf0c0a1-0000-4000-8000-000000000012",
+      "name": "示例提醒",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        340
+      ]
+    }
+  ],
+  "connections": {
+    "每 5 分钟": {
+      "main": [
+        [
+          {
+            "node": "确保状态表存在",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "手动测试": {
+      "main": [
+        [
+          {
+            "node": "确保状态表存在",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "确保状态表存在": {
+      "main": [
+        [
+          {
+            "node": "读取上次状态",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "读取上次状态": {
+      "main": [
+        [
+          {
+            "node": "监控列表",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "监控列表": {
+      "main": [
+        [
+          {
+            "node": "抓取页面",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "抓取页面": {
+      "main": [
+        [
+          {
+            "node": "判断状态",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "判断状态": {
+      "main": [
+        [
+          {
+            "node": "保存状态",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "保存状态": {
+      "main": [
+        [
+          {
+            "node": "生成提醒",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "生成提醒": {
+      "main": [
+        [
+          {
+            "node": "发送邮件",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "发送测试邮件": {
+      "main": [
+        [
+          {
+            "node": "示例提醒",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "示例提醒": {
+      "main": [
+        [
+          {
+            "node": "发送邮件",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none"
+  },
+  "pinData": {}
+}
